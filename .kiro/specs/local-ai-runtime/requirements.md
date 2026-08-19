@@ -11,7 +11,7 @@ The Runtime supports two operating modes chosen at launch via a flag:
 
 The developer may optionally bundle a pre-built web UI into the `.exe` at package time. When the Runtime launches in chat mode, it opens the user's default browser to the local UI automatically.
 
-The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vulkan), and Apple Silicon (Metal) support added in later phases.
+The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vulkan), and Apple Silicon (Metal) support added in later phases. The MVP targets Windows only; cross-platform paths are out of scope until Phase 2.
 
 ---
 
@@ -28,10 +28,12 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 - **GGUF**: The model file format used by llama.cpp
 - **Quantization**: A compression technique that reduces model size and memory usage (e.g., Q4_K_M, Q8_0)
 - **GPU Layers**: The number of model layers offloaded to GPU VRAM for acceleration
+- **Bytes Per Layer**: The memory cost of a single model layer, derived from the model's tensor metadata in the GGUF file at load time
 - **Context Size**: The maximum number of tokens the model can process in one session
 - **Hardware Detector**: The Runtime subsystem that identifies the user's GPU, VRAM, and available system RAM at startup
 - **Configurator**: The Runtime subsystem that selects GPU layer count and context size based on detected hardware
 - **API Server**: The Runtime subsystem that handles HTTP requests and serves the OpenAI-compatible REST API
+- **Self-Extractor**: The launcher stub embedded in the `.exe` that extracts bundled DLLs to a temp directory before any llama.cpp calls
 
 ---
 
@@ -44,8 +46,8 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 #### Acceptance Criteria
 
 1. THE Runtime SHALL be distributed as a single `.exe` file on Windows
-2. THE Runtime SHALL bundle all required libraries including the CUDA runtime, cuBLAS, and llama.cpp within the executable package
-3. WHEN the Runtime is launched, THE Runtime SHALL start without requiring the user to install any additional software
+2. THE Runtime SHALL bundle all required libraries including the CUDA runtime, cuBLAS, and llama.cpp as embedded resource sections within the executable
+3. WHEN the Runtime is launched, THE Self-Extractor SHALL extract all bundled DLLs to `%TEMP%/localai_<name>/` before any llama.cpp calls are made
 4. IF the host system does not have a compatible NVIDIA GPU driver installed, THEN THE Runtime SHALL fall back to CPU inference and notify the user in plain language
 5. THE Runtime SHALL NOT require administrator privileges to run
 
@@ -73,7 +75,7 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 1. WHEN an NVIDIA GPU with a compatible driver is detected, THE Configurator SHALL select the CUDA backend
 2. WHEN no compatible NVIDIA GPU is detected, THE Configurator SHALL select the CPU backend
 3. THE Configurator SHALL log the selected backend and the reason for selection to the log file
-4. IF the CUDA backend fails to initialize at runtime, THEN THE Configurator SHALL automatically fall back to the CPU backend and notify the user
+4. IF the CUDA backend fails to initialize at runtime, THEN THE Configurator SHALL automatically fall back to the CPU backend, set `gpu_layers` to 0, and notify the user with a message stating which backend was attempted and why it failed
 
 ---
 
@@ -83,9 +85,9 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 
 #### Acceptance Criteria
 
-1. WHEN the Runtime starts, THE Configurator SHALL calculate the maximum number of GPU layers that fit within available VRAM
-2. WHEN the Runtime starts, THE Configurator SHALL select a context size that fits within remaining memory after model layers are allocated
-3. THE Configurator SHALL log the chosen configuration in plain language before inference begins (e.g., "Running on RTX 4060 — 8 GB GPU memory, all layers on GPU")
+1. WHEN the Runtime starts, THE Configurator SHALL derive the per-layer memory cost from the model's GGUF tensor metadata, then calculate the maximum number of GPU layers that fit within available VRAM minus a 512 MB safety buffer, clamped to the range [0, total_model_layers]
+2. WHEN the Runtime starts, THE Configurator SHALL select the largest context size from the set [512, 1024, 2048, 4096, 8192, 16384, 32768] that fits within remaining memory after GPU layer allocation
+3. THE Configurator SHALL write a log line at INFO level to the structured log file before inference begins in the format: "Backend: <CUDA|CPU>, GPU layers: <n>/<total>, Context: <n> tokens, VRAM: <n> MB"
 4. WHERE an advanced user wants manual control, THE Runtime SHALL accept optional command-line flags to override GPU layer count, context size, and backend
 
 ---
@@ -97,10 +99,11 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 #### Acceptance Criteria
 
 1. THE Packager SHALL accept a GGUF model file as input and produce a single `.exe` that contains the model, llama.cpp, and the CUDA runtime
-2. THE Packager SHALL accept configuration inputs including the model file path, a display name, default operating mode (`server` or `chat`), optional default context size, and optional web UI assets directory
-3. WHEN the Runtime is built, THE Packager SHALL embed the GGUF model data into the executable or bundle it as a required sidecar file in the same directory
-4. THE Packager SHALL validate that the provided model file is a valid GGUF before producing the output executable
-5. IF the provided model file is not a valid GGUF, THEN THE Packager SHALL report a descriptive error and exit without producing output
+2. THE Packager SHALL accept the following configuration inputs: model file path (required), display name (required), default operating mode `server` or `chat` (default: `server`), optional default context size, optional web UI assets directory, optional API key, and output path
+3. WHEN the Runtime is built, THE Packager SHALL embed the GGUF model data and all DLLs as resource sections in the output `.exe`
+4. THE Packager SHALL validate that the provided model file begins with the GGUF magic bytes `0x47 0x47 0x55 0x46` and has a version field of 2 or 3 before producing the output executable
+5. IF the provided model file fails GGUF validation, THEN THE Packager SHALL print a descriptive error message to stderr and exit with a non-zero exit code without producing any output file
+6. THE Packager SHALL write a `manifest.json` into the bundle containing: `name`, `model_file`, `default_mode`, `default_context_size`, `api_key_hash` (SHA-256 with random salt, or null), `version`, and `schema_version`
 
 ---
 
@@ -111,13 +114,13 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 #### Acceptance Criteria
 
 1. WHEN the Runtime starts in server mode, THE API Server SHALL listen on a configurable port (default 8080) on localhost and optionally on all network interfaces
-2. THE API Server SHALL implement `POST /v1/chat/completions` accepting an OpenAI-compatible request body and returning an OpenAI-compatible response
-3. WHEN a client requests streaming via `"stream": true`, THE API Server SHALL return a Server-Sent Events stream of incremental tokens in OpenAI delta format
+2. THE API Server SHALL implement `POST /v1/chat/completions` accepting an OpenAI-compatible request body and returning an OpenAI-compatible response containing `id`, `object`, `created`, `model`, `choices`, and `usage` fields
+3. WHEN a client requests streaming via `"stream": true`, THE API Server SHALL return a Server-Sent Events stream of incremental tokens in OpenAI delta format, terminated by a final `data: [DONE]` event
 4. THE API Server SHALL implement `GET /v1/models` returning the bundled model's name and metadata
-5. THE API Server SHALL implement `GET /health` returning HTTP 200 with a JSON body indicating readiness
+5. THE API Server SHALL implement `GET /health` returning HTTP 200 with a JSON body `{"status":"ok","model_loaded":true}` when the model is loaded
 6. THE API Server SHALL implement `GET /metrics` returning current inference statistics including tokens per second and active request count
-7. WHEN multiple requests arrive concurrently, THE API Server SHALL queue them and process one at a time, returning an appropriate status to waiting clients
-8. WHERE the developer configures an API key at package time, THE API Server SHALL require that key as a Bearer token on all `/v1/` endpoints
+7. WHEN multiple requests arrive concurrently, THE API Server SHALL queue them and process one at a time; each waiting client SHALL receive its HTTP 200 response when its turn arrives, with no timeout imposed by the server
+8. WHERE the developer configures an API key at package time, THE API Server SHALL require that key as a Bearer token on all `/v1/` endpoints; the `/health` and `/metrics` endpoints SHALL remain unauthenticated
 
 ---
 
@@ -128,12 +131,12 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 #### Acceptance Criteria
 
 1. WHEN the Runtime is launched with the `--chat` flag or was packaged with `--mode chat`, THE Runtime SHALL start the API Server and then open the user's default browser to `http://localhost:<port>`
-2. THE Web UI SHALL display a chat input, a conversation history panel, and a configuration summary (model name, backend, GPU layers, context size)
-3. WHEN the user submits a message, THE Web UI SHALL stream the model's response token by token as it arrives
+2. THE Web UI SHALL display a chat input field, a conversation history panel with markdown rendering, and a configuration summary showing model name, backend, GPU layers, and context size
+3. WHEN the user submits a message, THE Web UI SHALL stream the model's response token by token as it arrives using the Fetch API with `ReadableStream`
 4. THE Web UI SHALL display tokens-per-second during active generation
-5. THE Web UI SHALL allow the user to stop generation
-6. THE Web UI SHALL maintain conversation history for the current session
-7. WHERE the developer did not bundle web UI assets, THEN THE Runtime SHALL log a warning and fall back to server-only mode rather than opening a broken browser page
+5. THE Web UI SHALL provide a stop button that aborts the in-progress fetch request
+6. THE Web UI SHALL maintain conversation history for the current session in memory, cleared on page refresh
+7. WHERE the developer did not bundle web UI assets, THEN THE Runtime SHALL log a warning and fall back to server-only mode rather than opening a browser page
 
 ---
 
@@ -151,7 +154,20 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 
 ---
 
-### Requirement 9: Error Handling and User Feedback
+### Requirement 9: Graceful Shutdown
+
+**User Story:** As an operator, I want the runtime to shut down cleanly when I press Ctrl+C, so that in-flight requests are not abruptly terminated and resources are released.
+
+#### Acceptance Criteria
+
+1. WHEN the Runtime receives a SIGINT or Ctrl+C signal, THE Runtime SHALL stop accepting new requests immediately
+2. WHEN shutdown is triggered, THE Runtime SHALL wait for any currently executing inference request to complete before exiting, up to a maximum of 30 seconds
+3. WHEN shutdown is triggered, THE Runtime SHALL cancel any requests waiting in the queue and close their connections
+4. WHEN shutdown completes, THE Runtime SHALL release all llama.cpp model and context resources before the process exits
+
+---
+
+### Requirement 10: Error Handling and User Feedback
 
 **User Story:** As a non-technical user, I want clear, plain-language feedback when something goes wrong, so that I understand what happened and what I can do.
 
@@ -159,15 +175,29 @@ The initial target is Windows with NVIDIA GPU (CUDA), with Linux, macOS, AMD (Vu
 
 1. IF model loading fails due to insufficient memory, THEN THE Runtime SHALL display a plain-language message explaining the issue and suggest reducing GPU layers or switching to CPU
 2. IF the CUDA backend fails to initialize, THEN THE Runtime SHALL display which backend was attempted, why it failed, and confirm the fallback being used
-3. THE Runtime SHALL write a structured log file to a known location (next to the executable or in `%TEMP%/localai_<name>/`) for diagnostic purposes
-4. IF the Runtime encounters an unrecoverable error, THEN THE Runtime SHALL display the log file location and a brief message before exiting rather than silently crashing
-5. IF the requested port is already in use, THEN THE Runtime SHALL report the port conflict and the port number in plain language and exit
+3. THE Runtime SHALL write timestamped structured log lines to `<exe_dir>/runtime.log`; if that path is not writable, THE Runtime SHALL fall back to `%TEMP%/localai_<name>/runtime.log`
+4. IF the Runtime encounters an unrecoverable error, THEN THE Runtime SHALL print the log file path and a brief plain-language message to stderr before exiting rather than silently crashing
+5. IF the requested port is already in use, THEN THE Runtime SHALL print a plain-language message identifying the port conflict and exit with a non-zero exit code
 
 ---
 
-### Requirement 10: Future Platform Support (Phase 2)
+### Requirement 11: Manifest Schema Versioning
+
+**User Story:** As a developer, I want the manifest format to be versioned, so that future schema changes do not silently break existing Runtime executables.
+
+#### Acceptance Criteria
+
+1. THE Manifest SHALL include a `schema_version` integer field
+2. WHEN the Runtime reads a manifest with a `schema_version` higher than it supports, THE Runtime SHALL log a warning and attempt to run using the fields it recognizes
+3. WHEN the Runtime reads a manifest with a missing or zero `schema_version`, THE Runtime SHALL treat it as `schema_version: 1` and log a warning
+
+---
+
+### Requirement 12: Future Platform Support (Phase 2 — Out of Scope for MVP)
 
 **User Story:** As a user on Linux, macOS, or with AMD/Intel hardware, I want the same experience to eventually be available on my platform, so that local AI is accessible regardless of my setup.
+
+> **Note:** All criteria in this requirement are out of scope for the current phase. They are captured here for architectural planning only.
 
 #### Acceptance Criteria
 
